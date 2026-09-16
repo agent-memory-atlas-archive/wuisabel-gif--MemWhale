@@ -55,6 +55,7 @@ fn run() -> Result<(), String> {
         Some("share") => return share_cmd(&raw_args[1..]),
         Some("discard") => return discard_cmd(),
         Some("replay") => return replay_command(&raw_args[1..]),
+        Some("compare") => return compare_command_runs(&raw_args[1..]),
         Some("demo") => return seed_demo(),
         Some("export") => return export_memory(&raw_args[1..]),
         Some("import") => return import_memory(&raw_args[1..]),
@@ -103,6 +104,78 @@ fn run() -> Result<(), String> {
         }
     }
     record_session(append_environment_tags(notes), live)
+}
+
+fn compare_command_runs(args: &[String]) -> Result<(), String> {
+    if args.len() != 2 {
+        return Err("usage: mw compare <run-id> <run-id>".to_string());
+    }
+    let left: i64 = args[0]
+        .parse()
+        .map_err(|_| format!("invalid run id: {}", args[0]))?;
+    let right: i64 = args[1]
+        .parse()
+        .map_err(|_| format!("invalid run id: {}", args[1]))?;
+    let conn = memorywhale_cli::storage::open()?;
+    let sql = "SELECT id, command, argv_json, cwd, exit_code, stdout, stderr, created_at,
+                      agent, capture_kind, repository_id, repository_name, worktree_root, notes
+               FROM command_runs WHERE id = ?1";
+    let load = |id| {
+        conn.query_row(sql, [id], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, Option<String>>(3)?,
+                row.get::<_, Option<i64>>(4)?,
+                row.get::<_, String>(5)?,
+                row.get::<_, String>(6)?,
+                row.get::<_, String>(7)?,
+                row.get::<_, Option<String>>(8)?,
+                row.get::<_, String>(9)?,
+                row.get::<_, Option<String>>(10)?,
+                row.get::<_, Option<String>>(11)?,
+                row.get::<_, Option<String>>(12)?,
+                row.get::<_, String>(13)?,
+            ))
+        })
+        .map_err(|e| format!("could not load command_run {id}: {e}"))
+    };
+    let a = load(left)?;
+    let b = load(right)?;
+    println!(
+        "Comparing command_run {} and {} (descriptive only; no causality inferred)",
+        left, right
+    );
+    let fields = [
+        ("command", a.1.clone(), b.1.clone()),
+        ("args", a.2.clone(), b.2.clone()),
+        ("cwd", format_opt(&a.3), format_opt(&b.3)),
+        ("exit_code", format_opt(&a.4), format_opt(&b.4)),
+        ("stdout", a.5.clone(), b.5.clone()),
+        ("stderr", a.6.clone(), b.6.clone()),
+        ("timestamp", a.7.clone(), b.7.clone()),
+        ("agent", format_opt(&a.8), format_opt(&b.8)),
+        ("capture_kind", a.9.clone(), b.9.clone()),
+        ("repository_id", format_opt(&a.10), format_opt(&b.10)),
+        ("repository_name", format_opt(&a.11), format_opt(&b.11)),
+        ("worktree_root", format_opt(&a.12), format_opt(&b.12)),
+        ("notes", a.13.clone(), b.13.clone()),
+    ];
+    for (name, av, bv) in fields {
+        println!("\n{name}:\n  [{}] {av}\n  [{}] {bv}", left, right);
+        if av != bv {
+            println!("  DIFFERENT");
+        }
+    }
+    Ok(())
+}
+
+fn format_opt<T: std::fmt::Display>(value: &Option<T>) -> String {
+    value
+        .as_ref()
+        .map(ToString::to_string)
+        .unwrap_or_else(|| "<none>".to_string())
 }
 
 fn record_session(notes: String, live: bool) -> Result<(), String> {
@@ -296,7 +369,7 @@ fn print_help() {
          mw status                print the effective capture mode for this directory and why\n\
          mw share [session|command] <id> [-o file]  write a self-contained HTML page to send to someone\n\
          mw discard               inside a recording: throw the current session away — nothing saved\n\
-         mw replay <run-id>       rerun a saved command from command_runs\n\
+         mw replay <run-id>       rerun a saved command from command_runs\n         mw compare <run-id> <run-id>  compare two command runs field by field (descriptive only)\n\
          mw demo                  seed a small demo terminal-memory dataset\n\
          mw export [project:name] export memory to Markdown + JSON\n\
          mw import <bundle|sqlite> merge another machine's exported memory into this one\n\
