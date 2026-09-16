@@ -40,7 +40,8 @@ pub(super) fn tool_defs() -> Value {
                 "query": {"type": "string", "description": "text to search for"},
                 "project": {"type": "string", "description": "optional: only memory recorded for this project, e.g. demo"},
                 "machine": {"type": "string", "description": "optional: only memory recorded on this machine"},
-                "agent": {"type": "string", "enum": crate::SEARCH_AGENTS, "description": "optional producing agent; terminal matches NULL/manual records"}
+                "agent": {"type": "string", "enum": crate::SEARCH_AGENTS, "description": "optional producing agent; terminal matches NULL/manual records"},
+                "explain": {"type": "boolean", "description": "optional: include full per-signal ranking details and snippet/provenance status"}
             }, "required": ["query"]}
         },
         {
@@ -99,6 +100,9 @@ pub(super) fn call_tool(
                 scope_arg(args, "project"),
                 scope_arg(args, "machine"),
                 agent_arg(args)?,
+                args.get("explain")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false),
             )
         }
         "get_context" => {
@@ -213,14 +217,22 @@ fn recent_errors(limit: i64) -> Result<String, String> {
 /// `reasons` the engine ranked it where it did, and — for remembered notes —
 /// who wrote it, so an agent can weigh a peer's lesson differently from a
 /// human's (additive; the tool's input schema is unchanged).
-fn render_hit(conn: &Connection, sm: &memorywhale_core::ScoredMemory) -> String {
+fn render_hit(conn: &Connection, sm: &memorywhale_core::ScoredMemory, explain: bool) -> String {
     let (source, real_id) = memorywhale_core::sqlite::decode_id(sm.memory.id);
-    let prov = match source {
+    let (prov, provenance_known) = match source {
         memorywhale_core::sqlite::Source::Note => note_provenance(conn, real_id)
-            .map(|p| format!("\n  {p}"))
-            .unwrap_or_default(),
-        _ => String::new(),
+            .map(|p| (format!("\n  {p}"), true))
+            .unwrap_or_else(|| ("\n  provenance: unknown".to_string(), false)),
+        _ => (String::new(), true),
     };
+    let full_first_line = sm
+        .memory
+        .text
+        .lines()
+        .find(|l| !l.trim().is_empty())
+        .unwrap_or("")
+        .trim();
+    let snippet_truncated = full_first_line.chars().count() > 160;
     let snippet: String = sm
         .memory
         .text
@@ -237,7 +249,7 @@ fn render_hit(conn: &Connection, sm: &memorywhale_core::ScoredMemory) -> String 
     } else {
         reasons.join("; ")
     };
-    format!(
+    let mut out = format!(
         "- [{} #{}] {}% — {}\n  agent: {}\n  reasons: {}{}\n",
         source.tag(),
         real_id,
@@ -246,7 +258,25 @@ fn render_hit(conn: &Connection, sm: &memorywhale_core::ScoredMemory) -> String 
         memorywhale_core::provenance::label(sm.memory.agent.as_deref()),
         reasons,
         prov
-    )
+    );
+    if explain {
+        out.push_str(&format!(
+            "  explanation: snippet_truncated={}, provenance_known={}\n",
+            snippet_truncated, provenance_known
+        ));
+        for signal in &sm.signals {
+            out.push_str(&format!(
+                "  signal {}: applicable={}, score={:.3}, weight={:.3}, contribution={:.3}; {}\n",
+                signal.name,
+                signal.applicable,
+                signal.score,
+                signal.weight,
+                signal.contribution(),
+                signal.detail
+            ));
+        }
+    }
+    out
 }
 
 /// Provenance for one remembered note, e.g. "remembered by Claude Code on
@@ -276,6 +306,7 @@ fn search_memory(
     project: Option<&str>,
     machine: Option<&str>,
     agent: Option<String>,
+    explain: bool,
 ) -> Result<String, String> {
     let conn = open()?;
     let now = Utc::now();
@@ -305,7 +336,7 @@ fn search_memory(
     }
     let mut out = String::new();
     for sm in &hits {
-        out.push_str(&render_hit(&conn, sm));
+        out.push_str(&render_hit(&conn, sm, explain));
     }
     Ok(out)
 }
@@ -371,7 +402,7 @@ fn get_context(
         return Ok(out);
     }
     for sm in &hits {
-        out.push_str(&render_hit(&conn, sm));
+        out.push_str(&render_hit(&conn, sm, false));
     }
     Ok(out)
 }
