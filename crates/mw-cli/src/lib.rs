@@ -158,7 +158,7 @@ const BOOKMARKS_BASE: &str = "CREATE TABLE IF NOT EXISTS bookmarks (
      CREATE INDEX IF NOT EXISTS idx_bookmarks_created_at ON bookmarks(created_at);";
 
 /// Schema version `migrate` brings a database up to.
-pub const LATEST_SCHEMA_VERSION: i64 = 10;
+pub const LATEST_SCHEMA_VERSION: i64 = 11;
 
 /// Apply numbered schema migrations to a MemoryWhale database. Idempotent and
 /// cheap (a `user_version` check), so callers run it before touching bookmarks.
@@ -193,6 +193,9 @@ pub const LATEST_SCHEMA_VERSION: i64 = 10;
 /// Migration 10 — structured command provenance: adds nullable `agent` to
 /// `command_runs`. Existing command runs remain NULL because their capture
 /// client is not known retroactively.
+///
+/// Migration 11 — retrieval feedback: creates `retrieval_feedback` for local,
+/// attributable helpful/wrong records. Additive; existing rows are untouched.
 pub fn migrate(conn: &Connection) -> Result<(), String> {
     let version: i64 = conn
         .query_row("PRAGMA user_version", [], |r| r.get(0))
@@ -302,6 +305,15 @@ pub fn migrate(conn: &Connection) -> Result<(), String> {
         ensure_agent(conn)?;
         conn.execute_batch("PRAGMA user_version = 10;")
             .map_err(|e| format!("failed to migrate command agent provenance: {e}"))?;
+    }
+    if version < 11 {
+        conn.execute_batch("CREATE TABLE IF NOT EXISTS retrieval_feedback (
+            id INTEGER PRIMARY KEY, memory_id INTEGER NOT NULL, kind TEXT NOT NULL,
+            created_at TEXT NOT NULL, source_session_id INTEGER, actor TEXT,
+            undone_at TEXT
+        ); CREATE INDEX IF NOT EXISTS idx_retrieval_feedback_memory ON retrieval_feedback(memory_id);
+        PRAGMA user_version = 11;")
+            .map_err(|e| format!("failed to migrate retrieval feedback: {e}"))?;
     }
     Ok(())
 }

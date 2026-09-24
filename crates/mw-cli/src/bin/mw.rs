@@ -68,6 +68,7 @@ fn run() -> Result<(), String> {
         Some("agent") => return agent_cmd(&raw_args[1..]),
         Some("ask") => return ask_cmd(&raw_args[1..]),
         Some("search") => return search_memory(&raw_args[1..]),
+        Some("feedback") => return feedback_cmd(&raw_args[1..]),
         Some("explain") => return explain_cmd(&raw_args[1..]),
         Some("link") => return link_cmd(&raw_args[1..]),
         Some("unlink") => return unlink_cmd(&raw_args[1..]),
@@ -414,6 +415,8 @@ fn print_help() {
          mw link <a> <b> [rel:<type>]  link two memories (default relation \"related\"); ids come from `mw search`\n\
          mw unlink <a> <b> [rel:<type>]  remove the link between two memories\n\
          mw links <id>            show a memory's linked neighbors (both directions)\n\
+         mw feedback add <memory-id> helpful|irrelevant|outdated|contradicted [--actor NAME]  record local retrieval feedback\n\
+         mw feedback list [memory-id] | show <id> | undo <id>  review or reverse feedback\n\
          mw pet [--watch]         a whale whose mood reflects your memory store (--watch animates it)\n\
          mw tui                   interactive terminal browser: type to search, arrow keys to move, Enter to reveal the command\n\
          mw sync-mempalace [--wing NAME] [--limit N] [--dry-run]  sync local memories into a running MemPalace server, idempotent by memory id (needs mempalace_command in config)\n\
@@ -1058,6 +1061,97 @@ fn update_session_from_transcript(
     )
     .map_err(|err| format!("failed to autosave session: {err}"))?;
     Ok(byte_count)
+}
+
+fn feedback_cmd(args: &[String]) -> Result<(), String> {
+    feedback_on(&open_session_db()?, args)
+}
+
+fn feedback_on(conn: &Connection, args: &[String]) -> Result<(), String> {
+    let action = args.first().map(String::as_str).unwrap_or("list");
+    match action {
+        "add" => {
+            const USAGE: &str = "usage: mw feedback add <memory-id> <kind> [--actor NAME]";
+            let (id_arg, kind, actor) = match &args[1..] {
+                [id, kind] => (id, kind.as_str(), None),
+                [id, kind, flag, actor] if flag == "--actor" => {
+                    (id, kind.as_str(), Some(actor.as_str()))
+                }
+                _ => return Err(USAGE.into()),
+            };
+            let memory_id = parse_link_id(id_arg)?;
+            if !["helpful", "irrelevant", "outdated", "contradicted"].contains(&kind) {
+                return Err(
+                    "feedback kind must be helpful, irrelevant, outdated, or contradicted".into(),
+                );
+            }
+            if !memory_map(conn)?.contains_key(&memory_id) {
+                return Err(format!(
+                    "no memory with id {memory_id} (list ids with `mw search`)"
+                ));
+            }
+            conn.execute("INSERT INTO retrieval_feedback (memory_id,kind,created_at,actor) VALUES (?1,?2,?3,?4)", params![memory_id, kind, Utc::now().to_rfc3339(), actor]).map_err(|e| e.to_string())?;
+            println!(
+                "feedback #{} recorded (display-only)",
+                conn.last_insert_rowid()
+            );
+        }
+        "list" | "show" => {
+            if args.len() > 2 || (action == "show" && args.len() != 2) {
+                return Err(
+                    "usage: mw feedback list [memory-id] | mw feedback show <feedback-id>".into(),
+                );
+            }
+            let (sql, id): (&str, Option<i64>) = if action == "show" {
+                ("SELECT id,memory_id,kind,created_at,actor,undone_at FROM retrieval_feedback WHERE id=?1", Some(args.get(1).ok_or("feedback id required")?.parse().map_err(|_| "invalid feedback id")?))
+            } else {
+                ("SELECT id,memory_id,kind,created_at,actor,undone_at FROM retrieval_feedback WHERE (?1 IS NULL OR memory_id=?1) ORDER BY id DESC", args.get(1).map(|x| x.parse().map_err(|_| "invalid memory id")).transpose()?)
+            };
+            let mut st = conn.prepare(sql).map_err(|e| e.to_string())?;
+            let rows = st
+                .query_map(params![id], |r| {
+                    Ok(format!(
+                        "#{} memory={} {} {} actor={} undone={} ",
+                        r.get::<_, i64>(0)?,
+                        r.get::<_, i64>(1)?,
+                        r.get::<_, String>(2)?,
+                        r.get::<_, String>(3)?,
+                        r.get::<_, Option<String>>(4)?.unwrap_or_default(),
+                        r.get::<_, Option<String>>(5)?.unwrap_or_default()
+                    ))
+                })
+                .map_err(|e| e.to_string())?;
+            let mut printed = 0;
+            for row in rows {
+                // actor is free-form input: strip terminal controls before printing.
+                println!("{}", compare_text(&row.map_err(|e| e.to_string())?));
+                printed += 1;
+            }
+            if action == "show" && printed == 0 {
+                return Err(format!("no feedback #{}", args[1]));
+            }
+        }
+        "undo" => {
+            let [_, id] = args else {
+                return Err("usage: mw feedback undo <feedback-id>".into());
+            };
+            let id: i64 = id.parse().map_err(|_| "invalid feedback id")?;
+            let changed = conn
+                .execute(
+                    "UPDATE retrieval_feedback SET undone_at=?1 WHERE id=?2 AND undone_at IS NULL",
+                    params![Utc::now().to_rfc3339(), id],
+                )
+                .map_err(|e| e.to_string())?;
+            if changed == 0 {
+                return Err(format!(
+                    "no active feedback #{id} (it does not exist or was already undone)"
+                ));
+            }
+            println!("feedback #{id} undone");
+        }
+        _ => return Err("usage: mw feedback add|list|show|undo".into()),
+    }
+    Ok(())
 }
 
 fn open_session_db() -> Result<Connection, String> {
@@ -2650,8 +2744,25 @@ fn import_sqlite(src: &std::path::Path) -> Result<(), String> {
         }
     }
 
+    // ponytail: feedback (like memory_links) is keyed by this store's row ids,
+    // which import does not preserve, so it stays machine-local. Say so rather
+    // than dropping it silently; port it once import tracks an id mapping.
+    let skipped_feedback: i64 = if src_has("retrieval_feedback") {
+        conn.query_row("SELECT COUNT(*) FROM src.retrieval_feedback", [], |r| {
+            r.get(0)
+        })
+        .map_err(|err| format!("failed to read source retrieval feedback: {err}"))?
+    } else {
+        0
+    };
+
     conn.execute("DETACH DATABASE src", [])
         .map_err(|err| format!("failed to detach source: {err}"))?;
+    if skipped_feedback > 0 {
+        eprintln!(
+            "mw: note: {skipped_feedback} retrieval feedback record(s) were not imported (feedback is machine-local)"
+        );
+    }
 
     // Rebuild the searchable argument rows for any newly imported command runs.
     rebuild_missing_arguments(&conn)?;
@@ -5106,6 +5217,51 @@ mod tests {
 
         drop(conn);
         // env + temp dirs are restored by the Cleanup guard on drop
+    }
+
+    #[test]
+    fn feedback_rejects_orphans_bad_args_and_noop_undo() {
+        let conn = Connection::open_in_memory().unwrap();
+        memorywhale_cli::storage::initialize(&conn).unwrap();
+        conn.execute(
+            "INSERT INTO command_runs (command, argv_json, created_at)
+             VALUES ('cargo build', '[]', '2026-01-01T00:00:00Z')",
+            [],
+        )
+        .unwrap();
+        let mem = memory_map(&conn).unwrap().into_keys().next().unwrap();
+        let run = |a: &[&str]| {
+            let args: Vec<String> = a.iter().map(|s| s.to_string()).collect();
+            feedback_on(&conn, &args)
+        };
+        let m = mem.to_string();
+
+        assert!(run(&["add", "999999999", "helpful"]).is_err(), "orphan id");
+        assert!(
+            run(&["add", &m, "helpful", "--actor"]).is_err(),
+            "dangling --actor"
+        );
+        assert!(
+            run(&["add", &m, "helpful", "extra"]).is_err(),
+            "unknown arg"
+        );
+        assert!(run(&["add", &m, "helpful", "--bogus", "x"]).is_err());
+        run(&["add", &m, "helpful", "--actor", "codex"]).unwrap();
+        let actor: String = conn
+            .query_row("SELECT actor FROM retrieval_feedback", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(actor, "codex");
+
+        assert!(run(&["undo", "777"]).is_err(), "nonexistent undo");
+        assert!(
+            run(&["undo", "1", "--actor", "x"]).is_err(),
+            "extra undo args"
+        );
+        assert!(run(&["show"]).is_err(), "show needs an id");
+        assert!(run(&["show", "999"]).is_err(), "missing feedback");
+        assert!(run(&["show", "1", "extra"]).is_err(), "extra show args");
+        run(&["undo", "1"]).unwrap();
+        assert!(run(&["undo", "1"]).is_err(), "repeated undo");
     }
 
     #[test]
