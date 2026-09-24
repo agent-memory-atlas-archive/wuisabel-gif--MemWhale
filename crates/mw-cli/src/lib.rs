@@ -1422,6 +1422,63 @@ pub fn filter_memories(
     mems
 }
 
+/// Conservative retrieval views based only on stored provenance and tags.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SearchMode {
+    Evidence,
+    /// Every saved note. `mw remember` and `mw mark` write identical rows, so
+    /// this view cannot tell a lesson from a plain bookmark.
+    Lessons,
+    Recipes,
+    Failures,
+}
+
+impl SearchMode {
+    pub fn parse(value: &str) -> Result<Self, String> {
+        match value {
+            "evidence" => Ok(Self::Evidence),
+            "lessons" => Ok(Self::Lessons),
+            "recipes" => Ok(Self::Recipes),
+            "failures" => Ok(Self::Failures),
+            "unresolved" => Err(
+                "search mode `unresolved` is not available: resolution is not stored reliably"
+                    .into(),
+            ),
+            _ => Err(format!(
+                "unknown search mode {value:?}; choose evidence, lessons, recipes, failures"
+            )),
+        }
+    }
+    pub fn apply(self, mut mems: Vec<memorywhale_core::Memory>) -> Vec<memorywhale_core::Memory> {
+        use memorywhale_core::sqlite::decode_id;
+        match self {
+            Self::Evidence => mems
+                .retain(|m| !matches!(decode_id(m.id).0, memorywhale_core::sqlite::Source::Note)),
+            Self::Lessons => {
+                mems.retain(|m| matches!(decode_id(m.id).0, memorywhale_core::sqlite::Source::Note))
+            }
+            Self::Recipes => mems.retain(|m| {
+                matches!(decode_id(m.id).0, memorywhale_core::sqlite::Source::Note)
+                    && has_fix_marker(&m.text)
+            }),
+            Self::Failures => mems.retain(|m| m.tags.iter().any(|t| t == "error")),
+        }
+        mems
+    }
+}
+
+/// `fix:` as its own token (start of text or after a non-word character), so
+/// `prefix:` and `suffix:` don't count as fix metadata.
+fn has_fix_marker(text: &str) -> bool {
+    let lower = text.to_lowercase();
+    lower.match_indices("fix:").any(|(i, _)| {
+        lower[..i]
+            .chars()
+            .next_back()
+            .is_none_or(|c| !c.is_alphanumeric() && c != '_')
+    })
+}
+
 /// True when agent-written memories should start unapproved and be excluded from
 /// retrieval until approved in the dashboard. On by default. Set
 /// `MEMORYWHALE_REVIEW_AGENT_MEMORIES=0` or
@@ -1812,6 +1869,16 @@ pub const PDEATH_FD_ENV: &str = "MW_PDEATH_FD";
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn fix_marker_requires_a_token_boundary() {
+        assert!(has_fix_marker("Fix: pin the linker"));
+        assert!(has_fix_marker("cargo failed. fix: set CC"));
+        assert!(has_fix_marker("(fix: retry)"));
+        assert!(!has_fix_marker("prefix: target triple"));
+        assert!(!has_fix_marker("the suffix: is ignored"));
+        assert!(!has_fix_marker("no marker here"));
+    }
 
     #[test]
     fn keeps_label_hides_value() {

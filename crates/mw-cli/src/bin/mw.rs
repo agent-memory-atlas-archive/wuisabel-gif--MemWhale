@@ -409,7 +409,7 @@ fn print_help() {
          mw import <bundle|sqlite> merge another machine's exported memory into this one\n\
          mw push <ssh-host>       send this machine's memory to a teammate (scp + remote mw import)\n\
          mw pull <ssh-host> [path] copy another machine's memory here and merge it (scp + import)\n\
-         mw search <text> [--explain] [tag:X] [source:command|session|note|document|conversation] [agent:claude|rho|cursor|codewhale|terminal] [after:YYYY-MM-DD] [before:YYYY-MM-DD] [limit:N] [--project X] [--machine Y] [--since 7d]  rank commands, sessions, and notes by relevance (--explain shows why)\n\
+         mw search <text> [--mode evidence|lessons|recipes|failures] [--explain] [tag:X] [source:command|session|note|document|conversation] [agent:claude|rho|cursor|codewhale|terminal] [after:YYYY-MM-DD] [before:YYYY-MM-DD] [limit:N] [--project X] [--machine Y] [--since 7d]  rank memories by relevance (--explain shows why)\n\
          mw explain <id> [query]  show the per-signal score breakdown for one memory (ids come from `mw search`)\n\
          mw link <a> <b> [rel:<type>]  link two memories (default relation \"related\"); ids come from `mw search`\n\
          mw unlink <a> <b> [rel:<type>]  remove the link between two memories\n\
@@ -3020,11 +3020,32 @@ fn note_meta(conn: &Connection, id: i64) -> Option<(String, String)> {
 fn search_memory(args: &[String]) -> Result<(), String> {
     let (scope, args) = Scope::take(args)?;
     let explain = args.iter().any(|a| a == "--explain");
-    let terms: Vec<&str> = args
-        .iter()
-        .map(|s| s.as_str())
-        .filter(|a| *a != "--explain")
-        .collect();
+    let mut mode_value: Option<String> = None;
+    let mut terms: Vec<&str> = Vec::new();
+    let mut iter = args.iter();
+    while let Some(a) = iter.next() {
+        let value = if a == "--mode" {
+            Some(
+                iter.next()
+                    .ok_or("--mode needs a value: evidence|lessons|recipes|failures")?
+                    .clone(),
+            )
+        } else {
+            a.strip_prefix("--mode=").map(str::to_owned)
+        };
+        match value {
+            Some(v) if mode_value.is_some() => {
+                return Err(format!("--mode given more than once (second value: {v:?})"))
+            }
+            Some(v) => mode_value = Some(v),
+            None if a == "--explain" => {}
+            None => terms.push(a.as_str()),
+        }
+    }
+    let mode = mode_value
+        .as_deref()
+        .map(memorywhale_cli::SearchMode::parse)
+        .transpose()?;
     // Pull inline `tag:`/`source:`/`agent:`/`before:`/`after:`/`limit:` filters out of the
     // terms; whatever's left is the free-text query.
     let (filters, query) = memorywhale_cli::parse_search_filters(&terms)?;
@@ -3035,7 +3056,7 @@ fn search_memory(args: &[String]) -> Result<(), String> {
         || filters.after.is_some();
     if query.is_empty() && !has_filter {
         return Err(
-            "usage: mw search <text> [--explain] [tag:X] [source:command|session|note|document|conversation] [agent:claude|rho|cursor|codewhale|terminal] [after:YYYY-MM-DD] [before:YYYY-MM-DD] [limit:N] [--project X] [--machine Y] [--since 7d]"
+            "usage: mw search <text> [--mode evidence|lessons|recipes|failures] [--explain] [tag:X] [source:command|session|note|document|conversation] [agent:claude|rho|cursor|codewhale|terminal] [after:YYYY-MM-DD] [before:YYYY-MM-DD] [limit:N] [--project X] [--machine Y] [--since 7d]"
                 .to_string(),
         );
     }
@@ -3044,7 +3065,8 @@ fn search_memory(args: &[String]) -> Result<(), String> {
     // ranks server-side over its own corpus, so the local scope filters don't
     // apply. If the server is unreachable we print a notice and fall through to
     // the builtin engine over local memory, so a misconfig never hard-fails.
-    if !has_filter {
+    // An explicit mode is enforced locally, so it never takes the external path.
+    if !has_filter && mode.is_none() {
         if let Some(argv) = memorywhale_cli::mempalace_command() {
             let (cmd, rest) = argv.split_first().expect("mempalace_command is non-empty");
             let eng = memorywhale_core::engine::MemPalaceEngine::new(cmd.clone(), rest.to_vec())
@@ -3078,6 +3100,11 @@ fn search_memory(args: &[String]) -> Result<(), String> {
         scope.machine.as_deref(),
         scope.cutoff(now),
     );
+    let mems = if let Some(mode) = mode {
+        mode.apply(mems)
+    } else {
+        mems
+    };
     // Inline tag:/source:/before:/after: filters narrow the set before ranking.
     let mems = memorywhale_cli::filter_memories(mems, &filters);
     let engine = memorywhale_core::engine::BuiltinEngine::new(mems);
