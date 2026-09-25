@@ -90,6 +90,31 @@ mw pull <ssh-host> [path]             # the reverse: copy another machine's memo
 mw global on|off|status               # auto-record every new terminal
 ```
 
+### Reusable command recipes
+
+Recipes are local metadata assembled only from explicitly selected recorded
+command IDs. Saving records the description, cwd, arguments, expected criteria,
+and source-run links; it never executes a command. The description,
+criteria, and cwd are redacted before they are stored, like other captured
+text. `copy` only prints the recorded argument JSON (redacted) and is safe to
+inspect; it is not guaranteed to be a pasteable shell command.
+
+These saved recipes are separate from `mw search --mode recipes`, which
+selects notes that carry a `fix:` marker.
+
+Every `--run` must share the same command and arguments (duplicates are
+ignored); the first listed run supplies the default cwd, and `show` lists
+sources in the order given. A recipe keeps its own payload, so `mw rm command`
+or `mw prune --older-than` on a source run only drops that provenance link.
+Recipes are not carried by `mw import`, `push`, or `pull`.
+
+```text
+mw recipe save --run 12,19 --description "rebuild" --cwd /work --criteria "tests pass"
+mw recipe list
+mw recipe show 1
+mw recipe copy 1
+```
+
 `mw` starts a recorded subshell; run commands normally, then `exit` or Ctrl-D
 to stop. The raw transcript lands in the data folder, searchable metadata in
 SQLite. `--live` matters for SSH sessions and sudden shutdown risk: if the
