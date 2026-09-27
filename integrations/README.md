@@ -51,6 +51,7 @@ features.
 | Hermes Agent | Yes | No | Example prompt | [Guide](hermes/README.md) |
 | Jan Desktop | Yes | No | No | [Guide](jan/README.md) |
 | Kimi Code CLI | Transport/configuration verified; native client call pending | No | Optional skill asset-checked; native loading pending | [Guide](kimi-code/README.md) |
+| Mistral Vibe | Transport/configuration verified; native client call pending | No | Optional skill asset-checked; native loading pending | [Guide](vibe/README.md) |
 | OpenClaw | Yes | No | Yes | [Guide](openclaw/README.md) |
 | OpenHands SDK | Local stdio verified; container/remote and native SDK run pending | No | Example prompt | [Guide](openhands/README.md) |
 | OpenCode | Yes | No | Example prompt | [Guide](opencode/README.md) |
