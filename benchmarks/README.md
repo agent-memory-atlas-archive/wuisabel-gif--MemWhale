@@ -63,3 +63,9 @@ questions), deterministic and offline. Plain BM25 ranks better than the default
 blend in 0.13 (NDCG@10 0.901 vs 0.802), all of it from the recency signal.
 Query-aware recency (unreleased) raises the default to 0.883.
 
+## 5. Terminal-Bench (planned): [`terminal_bench/`](terminal_bench/README.md)
+
+**Public tasks, public grading.** Runs Claude Code on
+[Terminal-Bench](https://www.tbench.ai) through its official Harbor harness,
+once alone and once with MemoryWhale carried across tasks. We did not write the
+tasks or the verifiers. Harness ready; no results yet.
