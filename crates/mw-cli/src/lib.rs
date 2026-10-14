@@ -52,7 +52,7 @@ pub(crate) static TEST_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(()
 
 use chrono::Utc;
 use regex::Regex;
-use rusqlite::{params, Connection};
+use rusqlite::{params, Connection, OptionalExtension};
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::OnceLock;
@@ -159,7 +159,7 @@ const BOOKMARKS_BASE: &str = "CREATE TABLE IF NOT EXISTS bookmarks (
      CREATE INDEX IF NOT EXISTS idx_bookmarks_created_at ON bookmarks(created_at);";
 
 /// Schema version `migrate` brings a database up to.
-pub const LATEST_SCHEMA_VERSION: i64 = 13;
+pub const LATEST_SCHEMA_VERSION: i64 = 14;
 
 /// Apply numbered schema migrations to a MemoryWhale database. Idempotent and
 /// cheap (a `user_version` check), so callers run it before touching bookmarks.
@@ -343,6 +343,23 @@ pub fn migrate(conn: &Connection) -> Result<(), String> {
              PRAGMA user_version = 13;",
         )
         .map_err(|e| format!("failed to migrate command recipes: {e}"))?;
+    }
+    if version < 14 {
+        // One row per recall note shown to an agent, so "was it followed, did
+        // it work" can be read back from the runs that came after.
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS recall_hints (
+                 id INTEGER PRIMARY KEY,
+                 run_id INTEGER NOT NULL,
+                 fix_argv_json TEXT NOT NULL,
+                 fix_run_id INTEGER,
+                 created_at TEXT NOT NULL,
+                 FOREIGN KEY(run_id) REFERENCES command_runs(id) ON DELETE CASCADE
+             );
+             CREATE INDEX IF NOT EXISTS idx_recall_hints_run_id ON recall_hints(run_id);
+             PRAGMA user_version = 14;",
+        )
+        .map_err(|e| format!("failed to migrate recall hints: {e}"))?;
     }
     ensure_memory_ref_cleanup(conn)?;
     Ok(())
@@ -834,7 +851,7 @@ fn error_hint_before(conn: &Connection, line: &str, before: i64) -> Result<Optio
     // lines if hint latency ever shows up.
     let mut stmt = conn
         .prepare(
-            "SELECT id, command, cwd, stderr FROM command_runs
+            "SELECT id, command, argv_json, cwd, stderr FROM command_runs
              WHERE exit_code IS NOT NULL AND exit_code != 0 AND id < ?1
              ORDER BY id DESC LIMIT 2000",
         )
@@ -844,8 +861,9 @@ fn error_hint_before(conn: &Connection, line: &str, before: i64) -> Result<Optio
             Ok((
                 r.get::<_, i64>(0)?,
                 r.get::<_, String>(1)?,
-                r.get::<_, Option<String>>(2)?,
-                r.get::<_, String>(3)?,
+                r.get::<_, String>(2)?,
+                r.get::<_, Option<String>>(3)?,
+                r.get::<_, String>(4)?,
             ))
         })
         .map_err(|e| format!("hint query: {e}"))?
@@ -853,7 +871,7 @@ fn error_hint_before(conn: &Connection, line: &str, before: i64) -> Result<Optio
         .map_err(|e| format!("hint row: {e}"))?;
     let matches: Vec<_> = failures
         .into_iter()
-        .filter(|(_, _, _, stderr)| {
+        .filter(|(_, _, _, _, stderr)| {
             stderr.lines().any(|l| {
                 let l = normalize_error_line(l).to_lowercase();
                 l.len() >= MIN_LEN && (target.contains(&l) || l.contains(&target))
@@ -863,35 +881,229 @@ fn error_hint_before(conn: &Connection, line: &str, before: i64) -> Result<Optio
     if matches.is_empty() {
         return Ok(None);
     }
-    let mut fix = None;
-    for (id, command, cwd, _) in &matches {
-        fix = conn
+    let failures: Vec<Failure> = matches
+        .into_iter()
+        .map(|(id, command, argv_json, cwd, _)| Failure {
+            id,
+            command,
+            argv_json,
+            cwd,
+        })
+        .collect();
+    let best = fix_candidates(conn, &failures)?.into_iter().next();
+    Ok(Some(format_hint(failures.len(), best.as_ref())))
+}
+
+/// A command that ran right after a recorded failure and passed: the usual
+/// shape of a fix. `worked` counts the episodes where the failing command then
+/// passed too, which is the evidence that it was the fix and not a bystander.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FixCandidate {
+    /// The most recent run of this fix.
+    pub run_id: i64,
+    pub argv_json: String,
+    /// Episodes where it was the next different passing command.
+    pub seen: i64,
+    /// Episodes where the failing command passed after it.
+    pub worked: i64,
+    /// Who ran it most recently (`None` is a terminal), and when.
+    pub agent: Option<String>,
+    pub at: String,
+}
+
+impl FixCandidate {
+    pub fn command(&self) -> String {
+        serde_json::from_str::<Vec<String>>(&self.argv_json)
+            .unwrap_or_default()
+            .join(" ")
+    }
+}
+
+/// A recorded failure, as [`fix_candidates`] needs it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Failure {
+    pub id: i64,
+    /// The program name (`command` column).
+    pub command: String,
+    pub argv_json: String,
+    pub cwd: Option<String>,
+}
+
+/// SQL for the command line behind an `argv_json` column, so runs captured by
+/// an agent hook (`["cargo build"]`) and at a prompt (`["cargo","build"]`)
+/// compare equal.
+const CMDLINE: &str = "(SELECT group_concat(value, ' ') FROM json_each({}))";
+
+/// Fix candidates for a set of failures of the same error, best first: most
+/// confirmations, then most sightings, then most recent. Each failure
+/// contributes at most one candidate, the next different passing command in
+/// the same directory within the following five runs; it counts as `worked`
+/// when the failing command line passed within the ten runs after the failure.
+pub fn fix_candidates(
+    conn: &Connection,
+    failures: &[Failure],
+) -> Result<Vec<FixCandidate>, String> {
+    let mut by_argv: std::collections::HashMap<String, FixCandidate> =
+        std::collections::HashMap::new();
+    let worked_sql = format!(
+        "SELECT EXISTS(
+           SELECT 1 FROM command_runs
+           WHERE id > ?1 AND id <= ?2 + 10 AND cwd IS ?3 AND exit_code = 0
+             AND {} = {})",
+        CMDLINE.replace("{}", "argv_json"),
+        CMDLINE.replace("{}", "?4")
+    );
+    for Failure {
+        id,
+        command,
+        argv_json,
+        cwd,
+    } in failures
+    {
+        let next: Option<(i64, String, Option<String>, String)> = conn
             .query_row(
-                "SELECT argv_json FROM command_runs
+                "SELECT id, argv_json, agent, created_at FROM command_runs
                  WHERE id > ?1 AND exit_code = 0 AND command != ?2 AND cwd IS ?3
                    AND id <= ?1 + 5
                  ORDER BY id LIMIT 1",
                 params![id, command, cwd],
-                |r| r.get::<_, String>(0),
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
             )
-            .ok()
-            .and_then(|argv| serde_json::from_str::<Vec<String>>(&argv).ok())
-            .filter(|argv| !argv.is_empty())
-            .map(|argv| argv.join(" "));
-        if fix.is_some() {
-            break;
+            .optional()
+            .map_err(|e| format!("fix candidate: {e}"))?;
+        let Some((fix_id, fix_argv, agent, at)) = next else {
+            continue;
+        };
+        if serde_json::from_str::<Vec<String>>(&fix_argv).is_ok_and(|argv| argv.is_empty()) {
+            continue;
+        }
+        let worked: bool = conn
+            .query_row(&worked_sql, params![fix_id, id, cwd, argv_json], |r| {
+                r.get(0)
+            })
+            .map_err(|e| format!("fix outcome: {e}"))?;
+        let entry = by_argv.entry(fix_argv.clone()).or_insert(FixCandidate {
+            run_id: fix_id,
+            argv_json: fix_argv,
+            seen: 0,
+            worked: 0,
+            agent: agent.clone(),
+            at: at.clone(),
+        });
+        entry.seen += 1;
+        entry.worked += worked as i64;
+        if fix_id > entry.run_id {
+            entry.run_id = fix_id;
+            entry.agent = agent;
+            entry.at = at;
         }
     }
-    let times = match matches.len() {
+    let mut candidates: Vec<FixCandidate> = by_argv.into_values().collect();
+    candidates.sort_by(|a, b| {
+        b.worked
+            .cmp(&a.worked)
+            .then(b.seen.cmp(&a.seen))
+            .then(b.run_id.cmp(&a.run_id))
+    });
+    Ok(candidates)
+}
+
+/// The one-line hint for an error seen `matches` times with `best` as its top
+/// fix candidate. The fix command always comes last, after `possible fix:` or
+/// `confirmed fix:`, which is what Delphin parses for `:fix`.
+fn format_hint(matches: usize, best: Option<&FixCandidate>) -> String {
+    let times = match matches {
         1 => "once".to_string(),
         n => format!("{n} times"),
     };
-    Ok(Some(match fix {
-        // The next different command that passed is a likely fix, not a
-        // confirmed one; say so. `possible fix:` is what Delphin parses.
-        Some(fix) => format!("seen {times}; a later command passed, possible fix: {fix}"),
-        None => format!("seen {times}, no fix recorded yet"),
-    }))
+    let Some(fix) = best else {
+        return format!("seen {times}, no fix recorded yet");
+    };
+    let by = format!("{} {}", ran_by(fix.agent.as_deref()), relative_age(&fix.at));
+    let command = fix.command();
+    match fix.worked {
+        w if w >= 2 => format!(
+            "seen {times}; worked {w} of {} times, last {by}, confirmed fix: {command}",
+            fix.seen
+        ),
+        1 => format!("seen {times}; worked once, {by}, possible fix: {command}"),
+        _ => format!("seen {times}; a later command passed, {by}, possible fix: {command}"),
+    }
+}
+
+/// "run by Claude Code" or "run in a terminal", for notes that say who did it:
+/// a fix from another agent is still a fix.
+pub fn ran_by(agent: Option<&str>) -> String {
+    match agent {
+        Some("claude") => "run by Claude Code".to_string(),
+        Some("codex") => "run by Codex".to_string(),
+        Some("cursor") => "run by Cursor".to_string(),
+        Some("gemini") => "run by Gemini CLI".to_string(),
+        Some("rho") => "run by Rho".to_string(),
+        Some("codewhale") => "run by Codewhale".to_string(),
+        _ => "run in a terminal".to_string(),
+    }
+}
+
+/// "just now", "5 min ago", "3 h ago", "2 days ago", or the raw timestamp
+/// when it does not parse.
+pub fn relative_age(created_at: &str) -> String {
+    let Ok(then) = chrono::DateTime::parse_from_rfc3339(created_at) else {
+        return created_at.to_string();
+    };
+    let minutes = (chrono::Utc::now() - then.with_timezone(&chrono::Utc))
+        .num_minutes()
+        .max(0);
+    match minutes {
+        0 => "just now".to_string(),
+        1..=59 => format!("{minutes} min ago"),
+        60..=2879 => format!("{} h ago", minutes / 60),
+        _ => format!("{} days ago", minutes / 1440),
+    }
+}
+
+/// How the recall notes have done so far: shown to an agent, followed (the
+/// suggested command ran within the next ten runs in that directory), and
+/// worked (the failing command then passed within twenty). Read back from the
+/// runs themselves, not from anyone's claim.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+pub struct RecallStats {
+    pub shown: i64,
+    pub followed: i64,
+    pub worked: i64,
+}
+
+pub fn recall_stats(conn: &Connection) -> RecallStats {
+    let line = |column: &str| CMDLINE.replace("{}", column);
+    let sql = format!(
+        "SELECT COUNT(*),
+                COALESCE(SUM(followed.id IS NOT NULL), 0),
+                COALESCE(SUM(worked.id IS NOT NULL), 0)
+         FROM recall_hints h
+         JOIN command_runs r ON r.id = h.run_id
+         LEFT JOIN command_runs followed ON followed.id = (
+             SELECT f.id FROM command_runs f
+             WHERE f.id > h.run_id AND f.id <= h.run_id + 10
+               AND {f} = {hf} AND f.cwd IS r.cwd
+             ORDER BY f.id LIMIT 1)
+         LEFT JOIN command_runs worked ON worked.id = (
+             SELECT s.id FROM command_runs s
+             WHERE s.id > followed.id AND s.id <= h.run_id + 20
+               AND {s} = {r} AND s.cwd IS r.cwd AND s.exit_code = 0
+             ORDER BY s.id LIMIT 1)",
+        f = line("f.argv_json"),
+        hf = line("h.fix_argv_json"),
+        s = line("s.argv_json"),
+        r = line("r.argv_json"),
+    );
+    conn.query_row(&sql, [], |r| {
+        Ok(RecallStats {
+            shown: r.get(0)?,
+            followed: r.get(1)?,
+            worked: r.get(2)?,
+        })
+    })
+    .unwrap_or_default()
 }
 
 /// A note for the agent right after a captured command, or `None`:
@@ -973,11 +1185,26 @@ pub fn hook_feedback(conn: &Connection, run_id: i64) -> Result<Option<String>, S
                 .any(|kw| l.contains(kw))
             });
             let Some(line) = line else { return Ok(None) };
-            Ok(error_hint_before(conn, line, run_id)?
-                .filter(|hint| hint.contains("possible fix:"))
-                .map(|hint| {
-                    format!("MemoryWhale: this error was {hint}. Check whether it applies here.")
-                }))
+            let hint = error_hint_before(conn, line, run_id)?
+                .filter(|hint| hint.contains("possible fix:") || hint.contains("confirmed fix:"));
+            let Some(hint) = hint else { return Ok(None) };
+            // Remember that this note was shown, so recall_stats can tell
+            // later whether the agent followed it and whether it worked.
+            let fix_json = hint
+                .rsplit_once("fix: ")
+                .map(|(_, command)| command)
+                .map(|command| {
+                    serde_json::to_string(&command.split(' ').collect::<Vec<_>>())
+                        .unwrap_or_default()
+                })
+                .unwrap_or_default();
+            let _ = conn.execute(
+                "INSERT INTO recall_hints (run_id, fix_argv_json, created_at) VALUES (?1, ?2, ?3)",
+                params![run_id, fix_json, at],
+            );
+            Ok(Some(format!(
+                "MemoryWhale: this error was {hint}. Check whether it applies here."
+            )))
         }
     }
 }
@@ -2730,6 +2957,85 @@ mod tests {
     }
 
     #[test]
+    fn confirmed_fix_outranks_a_bystander_and_names_the_agent() {
+        let conn = Connection::open_in_memory().unwrap();
+        storage::initialize(&conn).unwrap();
+        let run = |argv: &str, exit: i64, stderr: &str, agent: Option<&str>| {
+            conn.execute(
+                "INSERT INTO command_runs (command, argv_json, cwd, exit_code, stderr, created_at, agent)
+                 VALUES (json_extract(?1, '$[0]'), ?1, '/p', ?2, ?3, '2026-01-01T00:00:00Z', ?4)",
+                params![argv, exit, stderr, agent],
+            )
+            .unwrap();
+        };
+        let err = "error: linker `cc` not found";
+        // Two episodes where xcode-select ran and cargo build then passed,
+        // from two different agents; one where ls ran and nothing passed. (The
+        // `command` column is the program name, so `cargo fmt` would not count
+        // as a different command from `cargo build`.)
+        run(r#"["cargo","build"]"#, 101, err, Some("claude"));
+        run(r#"["xcode-select","--install"]"#, 0, "", Some("claude"));
+        run(r#"["cargo","build"]"#, 0, "", Some("claude"));
+        run(r#"["cargo","build"]"#, 101, err, Some("codex"));
+        run(r#"["xcode-select","--install"]"#, 0, "", Some("codex"));
+        run(r#"["cargo","build"]"#, 0, "", Some("codex"));
+        run(r#"["cargo","build"]"#, 101, err, Some("gemini"));
+        run(r#"["ls","-la"]"#, 0, "", Some("gemini"));
+
+        let hint = error_hint(&conn, err).unwrap().unwrap();
+        assert!(
+            hint.starts_with("seen 3 times; worked 2 of 2 times, last run by Codex"),
+            "{hint}"
+        );
+        assert!(
+            hint.ends_with(", confirmed fix: xcode-select --install"),
+            "{hint}"
+        );
+
+        let failures: Vec<Failure> = conn
+            .prepare(
+                "SELECT id, command, argv_json, cwd FROM command_runs WHERE exit_code = 101 ORDER BY id",
+            )
+            .unwrap()
+            .query_map([], |r| {
+                Ok(Failure {
+                    id: r.get(0)?,
+                    command: r.get(1)?,
+                    argv_json: r.get(2)?,
+                    cwd: r.get(3)?,
+                })
+            })
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        let ranked = fix_candidates(&conn, &failures).unwrap();
+        let summary: Vec<(String, i64, i64)> = ranked
+            .iter()
+            .map(|c| (c.command(), c.seen, c.worked))
+            .collect();
+        assert_eq!(
+            summary,
+            vec![
+                ("xcode-select --install".to_string(), 2, 2),
+                ("ls -la".to_string(), 1, 0)
+            ]
+        );
+        assert_eq!(ranked[0].agent.as_deref(), Some("codex"));
+        assert_eq!(ran_by(None), "run in a terminal");
+
+        // An agent hook stores the command line as one argument; a terminal
+        // rerun stores it split. The episode still counts as worked.
+        run(r#"["cargo build"]"#, 101, err, Some("claude"));
+        run(r#"["xcode-select","--install"]"#, 0, "", None);
+        run(r#"["cargo","build"]"#, 0, "", None);
+        let hint = error_hint(&conn, err).unwrap().unwrap();
+        assert!(
+            hint.contains("worked 3 of 3 times, last run in a terminal"),
+            "{hint}"
+        );
+    }
+
+    #[test]
     fn hint_matches_prefixed_live_line_and_names_the_fix() {
         let conn = Connection::open_in_memory().unwrap();
         storage::initialize(&conn).unwrap();
@@ -2748,9 +3054,11 @@ mod tests {
         run("make", r#"["make"]"#, 0, "");
         run("make", r#"["make"]"#, 2, err);
         let live = "  ⎿  Error: xcrun: error: invalid active developer path (/Library/Developer/CommandLineTools)";
-        assert_eq!(
-            error_hint(&conn, live).unwrap().as_deref(),
-            Some("seen 2 times; a later command passed, possible fix: xcode-select --install")
+        let hint = error_hint(&conn, live).unwrap().unwrap();
+        assert!(
+            hint.starts_with("seen 2 times; worked once, run in a terminal")
+                && hint.ends_with(", possible fix: xcode-select --install"),
+            "{hint}"
         );
         assert_eq!(
             error_hint(&conn, "error: something else entirely").unwrap(),
@@ -2816,6 +3124,12 @@ mod tests {
             "2026-01-04T00:00:00Z",
         );
         assert_eq!(hook_feedback(&conn, new).unwrap(), None);
+        // Every fix note shown so far was recorded.
+        let shown = |conn: &Connection| -> i64 {
+            conn.query_row("SELECT COUNT(*) FROM recall_hints", [], |r| r.get(0))
+                .unwrap()
+        };
+        assert_eq!(shown(&conn), 1);
         // Unknown exit with the error in stdout (Codex): still names the fix.
         conn.execute(
             "INSERT INTO command_runs (command, argv_json, cwd, stdout, created_at)
@@ -2829,6 +3143,26 @@ mod tests {
         assert!(
             note.contains("possible fix: xcode-select --install"),
             "{note}"
+        );
+        assert_eq!(shown(&conn), 2);
+        // A note is shown, the agent runs the suggested fix, the command
+        // passes: the stats read that back from the runs. The earlier notes
+        // sit within the same follow window, so they count too.
+        let shown_to = run(r#"["cargo","build"]"#, 101, err, "2026-01-06T00:00:00Z");
+        assert!(hook_feedback(&conn, shown_to).unwrap().is_some());
+        run(
+            r#"["xcode-select","--install"]"#,
+            0,
+            "",
+            "2026-01-06T00:01:00Z",
+        );
+        run(r#"["cargo","build"]"#, 0, "", "2026-01-06T00:02:00Z");
+        let stats = recall_stats(&conn);
+        assert_eq!(stats.shown, 3);
+        assert_eq!((stats.followed, stats.worked), (3, 3));
+        assert_eq!(
+            recall_stats(&Connection::open_in_memory().unwrap()),
+            RecallStats::default()
         );
         let _ = fail;
     }
