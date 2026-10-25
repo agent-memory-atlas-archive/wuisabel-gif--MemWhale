@@ -6,10 +6,18 @@ Codewhale preferences. No new `mw integrate codewhale` command is introduced.
 
 ## Required host contract
 
-Requires the separately reviewed Codewhale **post-admission execution receipt**
-change. Stock hosts that emit only legacy `DEEPSEEK_*` environment fields do not
-supply sufficient evidence and are not supported by this adapter. Installation
-or a plugin-enabled flag is not proof that a host produces receipts.
+Requires Codewhale **0.10.1 or later**, which ships the post-admission execution
+receipt (Hmbown/Codewhale#6713). Older hosts that emit only legacy `DEEPSEEK_*`
+environment fields do not supply sufficient evidence and are not supported by
+this adapter. Installation or a plugin-enabled flag is not proof that a host
+produces receipts.
+
+Codewhale builds a receipt only for an unsandboxed, pipe-backed, local
+foreground run. In the TUI that means **Full Access** mode. In Ask and Auto
+modes the shell runs inside the OS sandbox (Seatbelt on macOS): the hook still
+fires, but no receipt arrives and nothing is captured. Setting
+`sandbox_mode = "danger-full-access"` alone does not change that while the
+session is in Ask or Auto.
 
 The adapter consumes version-1 JSON on stdin for `tool_call_after`, restricted
 to native `exec_shell`, `Bash`, and `bash` aliases. It never joins before-hook
@@ -78,9 +86,11 @@ configuration rather than assuming the file alone defines runtime behavior.
   unavailable. Host/local truncation markers are retained.
 - Normal hook processing is silent and nonfatal. Explicit
   `MEMORYWHALE_HOOK_DIAGNOSTICS=1` enables fixed diagnostics, not payload dumps.
-- Different executions of the same command remain separate. There is no global
-  exactly-once delivery promise; manually replaying the same receipt can create
-  another record. Session/call IDs remain available for evidence correlation.
+- Replays with the same complete session/call identity are suppressed atomically
+  while the matching record exists. Different identities remain separate even
+  when the command is identical or one ID prefixes another. Deleting a record
+  permits it to be captured again; this is not a global exactly-once guarantee.
+  Session/call IDs remain available for evidence correlation.
 - Captured content can contain secrets despite redaction. The store remains
   local, but retrieved excerpts may be sent to a model provider by a client.
   Session transcript retention is not a capture-consent signal.
@@ -99,8 +109,8 @@ installation or marketplace publication is performed by this source bundle.
 
 ## Verification boundary
 
-The implementation must be validated against a receipt-capable pinned host.
 Offline parser/subprocess tests are not a substitute for native plugin review,
-activation, actual command execution, and fresh-client retrieval. The recorded
-host/adapter verification and prerequisite PR links belong in the main
-Codewhale integration verification report before release.
+activation, actual command execution, and fresh-client retrieval. This bundle
+was verified natively against stock Codewhale 0.10.1 in Full Access mode. See
+the [capture verification report](../CAPTURE-VERIFICATION.md) for the exact
+host, evidence, and remaining limits; other versions and modes are not implied.
